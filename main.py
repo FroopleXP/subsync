@@ -11,7 +11,8 @@ import google_auth_oauthlib.flow
 import googleapiclient.discovery
 import googleapiclient.errors
 
-scopes = ["https://www.googleapis.com/auth/youtube.readonly"]
+scopes = ["https://www.googleapis.com/auth/youtube.readonly",
+          "https://www.googleapis.com/auth/youtube.force-ssl"]
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 api_service_name = "youtube"
 api_version = "v3"
@@ -25,13 +26,20 @@ def auth_user():
     return flow.run_console()
 
 
+# Creates a YouTube client based on auth'd user creds
+def get_yt_client(creds):
+    return googleapiclient.discovery.build(
+        api_service_name, api_version, credentials=creds)
+
+
 # Gets all subscriptions for a user
-def get_user_subs(creds):
+def get_user_subs(yt_client):
     subscriptions = []
     next_page_token = None
 
     while True:
-        subs_res = get_single_subs_page(creds, next_page_token=next_page_token)
+        subs_res = get_single_subs_page(
+            yt_client, next_page_token=next_page_token)
         for sub in subs_res["items"]:
             subscriptions.append(sub["snippet"])
         if 'nextPageToken' in subs_res:
@@ -42,15 +50,33 @@ def get_user_subs(creds):
 
 
 # Requests a single page of subscriptions
-def get_single_subs_page(creds, next_page_token=None):
-    youtube = googleapiclient.discovery.build(
-        api_service_name, api_version, credentials=creds)
-    sub_request = youtube.subscriptions().list(
-        part="snippet,contentDetails", mine=True, pageToken=next_page_token, maxResults=50)
-    return sub_request.execute()
+def get_single_subs_page(yt_client, next_page_token=None):
+    sub_ls_req = yt_client.subscriptions().list(
+        part="snippet", mine=True, pageToken=next_page_token, maxResults=50)
+    return sub_ls_req.execute()
+
+
+# Subscribe a user to a channel
+def sub_to_channel(yt_client, sub):
+    res = sub["resourceId"]
+    sub_ins_req = yt_client.subscriptions().insert(
+        part="snippet", body={"snippet": {"resourceId": res}})
+    return sub_ins_req.execute()
+
+
+# Commits the subscriptions
+def commit_subs(yt_client, subs):
+    for sub in subs:
+        print("Subscribing to %s..." % (sub["title"]), end="\t")
+        try:
+            sub_to_channel(yt_client, sub)
+            print("[Done]")
+        except googleapiclient.errors.HttpError:
+            print("[Fail]")
 
 
 # Checks if a sub exists in a list of subs
+# TODO: I think this can be optimized, it's the slowest part at the mo.
 def sub_exists_in_subs(sub, subs):
     chan_id = sub["resourceId"]["channelId"]
     exists = False
@@ -69,9 +95,15 @@ def get_sub_diff(user_a_subs, user_b_subs):
     return diff
 
 
+# Display title
+def display_title(title):
+    print("\n\n---\n%s\n=======================\n" % (title))
+
+
 # Nicely displays a subscription to the user
 def display_sub(sub):
-    print("%s\n====\n\t%s\n" % (sub["title"], sub["description"]))
+    display_title(sub["title"])
+    print(sub["description"])
 
 
 # Display a minimal version of a subscription
@@ -79,10 +111,17 @@ def display_sub_min(sub):
     print("\t- %s" % (sub["title"]))
 
 
+# Displays subs before commiting them
+def display_sub_overview(subs):
+    display_title("Subscription Overview")
+    for sub in subs:
+        display_sub_min(sub)
+
+
 # Prompts the user to subscribe if they wish
 def user_wants_sub_or_skip_rest(sub):
     display_sub(sub)
-    inp = input("Subscribe to this channel? Y/n (s to skip rest): ")
+    inp = input("\nSubscribe to this channel? Y/n (s to skip rest): ")
     if inp:
         if inp == "n" or inp == "N":
             return (False, False)
@@ -91,9 +130,28 @@ def user_wants_sub_or_skip_rest(sub):
     return (True, False)
 
 
+# Prompts to user to commit or cancel subscriptions
+def user_wants_to_commit_subs(subs):
+    display_sub_overview(subs)
+    inp = input(
+        "\nWould you like to commit %s subscriptions? Y/n: " % (len(subs)))
+    if not inp:
+        return True
+    return False
+
+
 # Ask the user for the channels they want to sub to
 def get_subs_user_wants(subs):
     channels_to_sub = []
+
+    # Check if the user wants to sync all or pick
+    all_or_pick_inp = input(
+        "Sync all subscriptions or pick? A/p (A to sync all, p to pick):")
+    if not all_or_pick_inp:  # Def.
+        return subs
+    if all_or_pick_inp != "p":  # Non-def. opt.
+        return get_subs_user_wants(subs)
+
     for sub in subs:
         inp = user_wants_sub_or_skip_rest(sub)
         if inp[1]:  # Skip
@@ -104,23 +162,25 @@ def get_subs_user_wants(subs):
 
 
 def main():
+
+    display_title("Authenticating user A")
     user_a_creds = auth_user()
+
+    display_title("Authenticating user B")
     user_b_creds = auth_user()
 
-    user_a_subs = get_user_subs(user_a_creds)
-    user_b_subs = get_user_subs(user_b_creds)
+    user_a_yt_client = get_yt_client(user_a_creds)
+    user_b_yt_client = get_yt_client(user_b_creds)
 
-    print("Total user A subs %i\nTotal user B subs %i" %
-          (len(user_a_subs), len(user_b_subs)))
+    user_a_subs = get_user_subs(user_a_yt_client)
+    user_b_subs = get_user_subs(user_b_yt_client)
 
     sub_diff = get_sub_diff(user_a_subs, user_b_subs)
 
-    print("Total diff %i" % (len(sub_diff)))
-
     subs_user_wants = get_subs_user_wants(sub_diff)
 
-    for sub in subs_user_wants:
-        display_sub_min(sub)
+    if user_wants_to_commit_subs(subs_user_wants):
+        commit_subs(user_b_yt_client, subs_user_wants)
 
 
 if __name__ == "__main__":
